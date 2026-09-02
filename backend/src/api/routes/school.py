@@ -3,7 +3,10 @@ School dashboard routes (protected — school role required).
 
 GET  /school/me                                  — profile
 GET  /school/classes                             — list available classes (1–5)
+GET  /school/subject-setup                       — class-wise subject options + current selection
+PUT  /school/subject-setup                       — save the subjects this school teaches
 GET  /school/classes/{class_number}/modules      — modules for a class
+GET  /school/classes/{class_number}/quiz-summaries — students' diagnostic quiz results
 POST /school/classes/{class_number}/modules/pdf  — upload PDF module
 POST /school/classes/{class_number}/modules/images — upload image(s) → PDF module
 POST /school/classes/{class_number}/modules/ncert  — add pre-loaded NCERT book
@@ -11,6 +14,11 @@ PUT  /school/classes/{class_number}/modules/{module_id}/replace-pdf    — repla
 PUT  /school/classes/{class_number}/modules/{module_id}/replace-images — replace with new images
 PATCH /school/classes/{class_number}/modules/{module_id}/title         — update title only
 DELETE /school/classes/{class_number}/modules/{module_id}              — delete module
+
+Teacher management (school admin):
+GET  /school/teachers                                         — list teachers in this branch
+POST /school/teachers/{teacher_id}/assign-class               — assign a class+section
+DELETE /school/teachers/{teacher_id}/assign-class/{class_number}/{section} — de-assign
 """
 
 import uuid
@@ -18,15 +26,25 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.database import get_session
 from src.core.dependencies import get_current_school
 from src.models.module import Module, OcrStatus
 from src.models.school import School
+from src.models.school_subject import SchoolClassSubject
 from src.schemas.module import ModuleOut, NCERTModuleAddRequest, UpdateModuleTitleRequest
+from src.schemas.quiz import StudentQuizSummaryOut
 from src.schemas.school import SchoolProfile
-from src.services import module_service
+from src.schemas.school_subject import (
+    ClassSubjectOptions,
+    SchoolSubjectDetail,
+    SubjectSetupOut,
+    SubjectSetupRequest,
+)
+from src.schemas.teacher import AssignClassRequest, TeacherClassOut, TeacherListItem
+from src.services import module_service, quiz_service, school_subject_service, teacher_service
 
 router = APIRouter(prefix="/school", tags=["School Dashboard"])
 
@@ -52,7 +70,74 @@ async def get_school_profile(school: School = Depends(get_current_school)):
     summary="List available classes (always 1–5)",
 )
 async def list_classes(_: School = Depends(get_current_school)):
-    return list(range(1, 6))
+    return list(school_subject_service.SUPPORTED_CLASSES)
+
+
+@router.get(
+    "/subjects",
+    response_model=list[SchoolSubjectDetail],
+    summary="Get all configured class-wise subjects and publishers for this school",
+)
+async def get_school_subjects(
+    class_number: Optional[int] = None,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = select(SchoolClassSubject).where(SchoolClassSubject.school_id == school.id)
+    if class_number is not None:
+        stmt = stmt.where(SchoolClassSubject.class_number == class_number)
+    stmt = stmt.order_by(SchoolClassSubject.class_number, SchoolClassSubject.subject)
+    res = await session.execute(stmt)
+    return res.scalars().all()
+
+
+# ── First-run setup: which subjects this school teaches, per class ────────────
+
+@router.get(
+    "/subject-setup",
+    response_model=SubjectSetupOut,
+    summary="Class-wise subject options and this school's current selection",
+)
+async def get_subject_setup(
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    catalog = await school_subject_service.get_catalog(session)
+    selected = await school_subject_service.get_selection(school, session)
+
+    return SubjectSetupOut(
+        completed=school_subject_service.is_complete(school),
+        configured_at=school.subjects_configured_at,
+        classes=[
+            ClassSubjectOptions(
+                class_number=class_number,
+                class_label=school_subject_service.class_label(class_number),
+                subject_count=len(subjects),
+                subjects=subjects,
+                selected=selected.get(class_number, []),
+            )
+            for class_number, subjects in catalog.items()
+        ],
+    )
+
+
+@router.put(
+    "/subject-setup",
+    response_model=SubjectSetupOut,
+    summary="Save the subjects this school teaches for each class",
+)
+async def save_subject_setup(
+    data: SubjectSetupRequest,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    await school_subject_service.save_selection(
+        school,
+        [(entry.class_number, entry.subjects) for entry in data.classes],
+        session,
+    )
+    await session.flush()
+    return await get_subject_setup(school=school, session=session)
 
 
 @router.get(
@@ -68,6 +153,22 @@ async def get_class_modules(
     return await module_service.get_class_modules(school.branch_name, class_number, session)
 
 
+@router.get(
+    "/classes/{class_number}/quiz-summaries",
+    response_model=list[StudentQuizSummaryOut],
+    summary="Get every student's diagnostic quiz result for a class (class teacher view)",
+)
+async def get_class_quiz_summaries(
+    class_number: int,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    summaries = await quiz_service.get_class_quiz_summaries(
+        school.branch_name, class_number, session
+    )
+    return [StudentQuizSummaryOut(**s) for s in summaries]
+
+
 @router.post(
     "/classes/{class_number}/modules/pdf",
     response_model=ModuleOut,
@@ -78,11 +179,16 @@ async def upload_pdf_module(
     class_number: int,
     title: Annotated[str, Form()],
     file: Annotated[UploadFile, File(description="PDF file (max 50 MB)")],
+    subject: Annotated[
+        Optional[str],
+        Form(description="Mathematics | English | Hindi | EVS — enables this module as a "
+                          "diagnostic-quiz question source for this school"),
+    ] = None,
     school: School = Depends(get_current_school),
     session: AsyncSession = Depends(get_session),
 ):
     module = await module_service.add_pdf_module(
-        school.branch_name, class_number, title, file, session
+        school.branch_name, class_number, title, file, session, subject=subject
     )
     return ModuleOut.model_validate(module)
 
@@ -97,11 +203,16 @@ async def upload_images_module(
     class_number: int,
     title: Annotated[str, Form()],
     files: Annotated[list[UploadFile], File(description="JPEG/PNG images (max 50 MB each)")],
+    subject: Annotated[
+        Optional[str],
+        Form(description="Mathematics | English | Hindi | EVS — enables this module as a "
+                          "diagnostic-quiz question source for this school"),
+    ] = None,
     school: School = Depends(get_current_school),
     session: AsyncSession = Depends(get_session),
 ):
     module = await module_service.add_images_module(
-        school.branch_name, class_number, title, files, session
+        school.branch_name, class_number, title, files, session, subject=subject
     )
     return ModuleOut.model_validate(module)
 
@@ -286,4 +397,189 @@ async def retry_module_ocr(
             "To re-run OCR, please use PUT /school/classes/{class_number}/modules/{module_id}/replace-images "
             "to re-upload the images. This will automatically trigger fresh OCR."
         ),
+    )
+
+
+# ── Chunk Ingestion & Inspection ──────────────────────────────────────────────
+
+from src.schemas.chunk import ChunkOut, ModuleIngestRequest
+from src.services import chunk_service
+
+
+@router.post(
+    "/classes/{class_number}/modules/{module_id}/ingest",
+    response_model=list[ChunkOut],
+    summary="Ingest custom or updated text content for a module into document chunks",
+)
+async def ingest_module_chunks(
+    class_number: int,
+    module_id: uuid.UUID,
+    data: Optional[ModuleIngestRequest] = None,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    module = await session.get(Module, module_id)
+    if not module or module.branch_name != school.branch_name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Module not found.",
+        )
+
+    text_to_ingest = (data.text if data and data.text else None) or f"Chapter 1: {module.title}\n\n{module.title}"
+    effective_subject = (data.subject if data and data.subject else None) or module.subject
+
+    if data and data.subject:
+        module.subject = data.subject
+        session.add(module)
+
+    chunks = await chunk_service.ingest_module_text(
+        session=session,
+        branch_name=school.branch_name,
+        class_number=class_number,
+        subject=effective_subject,
+        text=text_to_ingest,
+        module_id=module.id,
+        module_title=module.title,
+    )
+    return [ChunkOut.model_validate(c) for c in chunks]
+
+
+@router.get(
+    "/classes/{class_number}/modules/{module_id}/chunks",
+    response_model=list[ChunkOut],
+    summary="Get all chunks formed for a specific module",
+)
+async def get_module_chunks(
+    class_number: int,
+    module_id: uuid.UUID,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    from sqlmodel import select
+    from src.models.chunk import DocumentChunk
+
+    module = await session.get(Module, module_id)
+    if not module or module.branch_name != school.branch_name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Module not found.",
+        )
+
+    res = await session.execute(
+        select(DocumentChunk)
+        .where(DocumentChunk.module_id == module_id)
+        .order_by(DocumentChunk.chapter_number, DocumentChunk.chunk_index)
+    )
+    chunks = list(res.scalars().all())
+    return [ChunkOut.model_validate(c) for c in chunks]
+
+
+# ── Teacher management (school admin) ─────────────────────────────────────────
+
+@router.get(
+    "/teachers",
+    response_model=list[TeacherListItem],
+    summary="List all teachers registered in this school branch",
+)
+async def list_teachers(
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    teachers = await teacher_service.list_branch_teachers(school.branch_name, session)
+    result = []
+    for t in teachers:
+        classes = await teacher_service.get_assigned_classes(t, session)
+        # Skip records with NULL/empty subject — broken legacy entries that
+        # would crash Pydantic serialization and break the entire response.
+        class_outs = [
+            TeacherClassOut(
+                id=c.id,
+                teacher_id=c.teacher_id,
+                class_number=c.class_number,
+                section=c.section,
+                subject=c.subject or "",
+                label=f"{c.class_number}{c.section} \u2022 {c.subject or 'Unset'}",
+                assigned_at=c.assigned_at,
+            )
+            for c in classes
+            if c.subject  # skip NULL/empty subject records
+        ]
+        result.append(
+            TeacherListItem(
+                id=t.id,
+                name=t.name,
+                phone_number=t.phone_number,
+                is_active=t.is_active,
+                assigned_classes=class_outs,
+                created_at=t.created_at,
+            )
+        )
+    return result
+
+
+@router.post(
+    "/teachers/{teacher_id}/assign-class",
+    response_model=TeacherClassOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Assign a class section and subject to a teacher",
+)
+async def assign_class_to_teacher(
+    teacher_id: uuid.UUID,
+    data: AssignClassRequest,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    tca = await teacher_service.assign_class_to_teacher(
+        teacher_id, school.branch_name, data, session
+    )
+    return TeacherClassOut(
+        id=tca.id,
+        teacher_id=tca.teacher_id,
+        class_number=tca.class_number,
+        section=tca.section,
+        subject=tca.subject,
+        label=f"{tca.class_number}{tca.section} • {tca.subject}",
+        assigned_at=tca.assigned_at,
+    )
+
+
+@router.delete(
+    "/teachers/{teacher_id}/assignments/{assignment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a teacher class subject assignment by assignment ID",
+)
+async def deassign_by_id(
+    teacher_id: uuid.UUID,
+    assignment_id: uuid.UUID,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    await teacher_service.deassign_class_from_teacher(
+        teacher_id=teacher_id,
+        branch_name=school.branch_name,
+        assignment_id=assignment_id,
+        session=session,
+    )
+
+
+@router.delete(
+    "/teachers/{teacher_id}/assign-class/{class_number}/{section}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a class section and optional subject assignment from a teacher",
+)
+async def deassign_class_from_teacher(
+    teacher_id: uuid.UUID,
+    class_number: int,
+    section: str,
+    subject: Optional[str] = None,
+    school: School = Depends(get_current_school),
+    session: AsyncSession = Depends(get_session),
+):
+    await teacher_service.deassign_class_from_teacher(
+        teacher_id=teacher_id,
+        branch_name=school.branch_name,
+        class_number=class_number,
+        section=section,
+        subject=subject,
+        session=session,
     )

@@ -11,10 +11,12 @@ class ModuleOut(BaseModel):
     id: uuid.UUID
     branch_name: str
     class_number: int
+    subject: str
     title: str
     source_type: SourceType
     file_url: str
     ncert_book_id: Optional[uuid.UUID]
+    subject: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     # OCR fields — only meaningful for image_upload modules
@@ -45,3 +47,18 @@ class NCERTBookOut(BaseModel):
     file_url: Optional[str]
 
     model_config = {"from_attributes": True}
+
+
+class NCERTBookCreateRequest(BaseModel):
+    class_number: int
+    subject: str
+    title: str
+    description: Optional[str] = None
+
+
+class NCERTBookUpdateRequest(BaseModel):
+    class_number: Optional[int] = None
+    subject: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+

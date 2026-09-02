@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { BrandLogo } from "@/components/layout/BrandLogo";
 import { motion } from "framer-motion";
 import {
   ShieldCheck,
@@ -66,17 +67,7 @@ export default function SuperAdminLoginPage() {
 
       {/* Header Bar */}
       <header className="p-6 flex items-center justify-between z-10">
-        <Link href="/" className="flex items-center gap-2.5 group">
-          <div
-            className="w-10 h-10 rounded-[var(--radius-sm)] flex items-center justify-center"
-            style={{ background: "var(--gradient-brand)" }}
-          >
-            <Sparkles className="w-5 h-5 text-white" />
-          </div>
-          <span className="font-[family-name:var(--font-display)] text-xl font-bold text-text-primary group-hover:text-brand transition-colors">
-            VidyaSetu
-          </span>
-        </Link>
+        <BrandLogo size="lg" priority className="py-0.5" />
 
         <div className="flex items-center gap-4">
           <ThemeToggle />
@@ -142,7 +133,7 @@ export default function SuperAdminLoginPage() {
                   <Mail className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-text-tertiary" />
                   <input
                     type="email"
-                    placeholder="admin@inclulearn.com"
+                    placeholder="admin@vidyasetu.ai"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     className="w-full pl-10 pr-4 py-2.5 bg-surface text-text-primary text-sm rounded-[var(--radius-md)] border border-border-primary focus:border-brand focus:outline-none transition-colors"

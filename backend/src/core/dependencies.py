@@ -54,6 +54,30 @@ def _maybe_refresh(payload: dict, response: Response) -> None:
         response.headers["X-Access-Token"] = new_token
 
 
+def _require_verified_school(school) -> None:
+    """
+    School Admin access is gated on an approved administrator claim.
+
+    Accounts that predate the verification flow are migrated to 'verified', so
+    this only blocks schools still awaiting or refused verification.
+    """
+    verification_status = getattr(school, "verification_status", "verified")
+    if verification_status == "verified":
+        return
+    if verification_status == "rejected":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="School verification was rejected. Administrator access is not available.",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            "Your authority to administer this school is still being verified. "
+            "School management features will become available after approval."
+        ),
+    )
+
+
 # ── School ─────────────────────────────────────────────────────────────────────
 
 async def get_current_school(
@@ -71,6 +95,7 @@ async def get_current_school(
     school = await session.get(School, school_id)
     if not school:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="School not found.")
+    _require_verified_school(school)
     return school
 
 
@@ -132,3 +157,59 @@ async def get_current_admin(
     if not admin:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admin not found.")
     return admin
+
+
+# ── Teacher ────────────────────────────────────────────────────────────────────
+
+async def get_current_teacher(
+    response: Response,
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    session: AsyncSession = Depends(get_session),
+):
+    from src.models.teacher import Teacher
+
+    payload = _extract_payload(credentials)
+    _check_role(payload, "teacher")
+    _maybe_refresh(payload, response)
+
+    teacher_id = uuid.UUID(payload["sub"])
+    teacher = await session.get(Teacher, teacher_id)
+    if not teacher:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found.")
+    return teacher
+
+
+# ── School Admin or Superadmin Dual Dependency ──────────────────────────────────
+
+async def get_current_school_or_admin(
+    response: Response,
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    session: AsyncSession = Depends(get_session),
+):
+    from src.models.school import School
+    from src.models.admin import Admin
+
+    payload = _extract_payload(credentials)
+    role = payload.get("role")
+    if role not in ("school", "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access restricted to school branch admin or platform admin accounts.",
+        )
+    _maybe_refresh(payload, response)
+
+    entity_id = uuid.UUID(payload["sub"])
+    if role == "school":
+        entity = await session.get(School, entity_id)
+        if entity:
+            _require_verified_school(entity)
+    else:
+        entity = await session.get(Admin, entity_id)
+
+    if not entity:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{role.capitalize()} user not found.",
+        )
+    return entity
+

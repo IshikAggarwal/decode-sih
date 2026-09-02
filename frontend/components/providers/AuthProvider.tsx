@@ -7,6 +7,7 @@ import {
   SchoolProfile,
   ParentProfile,
   AdminProfile,
+  TeacherProfile,
   getStoredToken,
   getStoredRole,
   clearStoredAuth,
@@ -14,17 +15,22 @@ import {
   loginSchool,
   loginParent,
   loginAdmin,
+  loginTeacher,
+  loginWithOTP,
   registerStudent,
   registerSchool,
   registerParent,
+  registerTeacher,
   getStudentProfile,
   getSchoolProfile,
   getParentProfile,
   getAdminProfile,
+  getTeacherProfile,
   setupStudentClass as setupStudentClassApi,
 } from "@/lib/api";
+import { readCache, writeCache } from "@/lib/offline/db";
 
-type UserProfile = StudentProfile | SchoolProfile | ParentProfile | AdminProfile | null;
+type UserProfile = StudentProfile | SchoolProfile | ParentProfile | AdminProfile | TeacherProfile | null;
 
 interface AuthContextType {
   user: UserProfile;
@@ -33,6 +39,7 @@ interface AuthContextType {
   loading: boolean;
   error: string | null;
   login: (role: Role, data: any) => Promise<void>;
+  loginOTP: (role: Role, phone_number: string, otp_code: string, branch_name?: string) => Promise<void>;
   register: (role: Role, data: any) => Promise<void>;
   logout: () => void;
   refreshProfile: () => Promise<void>;
@@ -51,20 +58,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const fetchProfileForRole = useCallback(async (currentRole: Role) => {
     try {
+      let profile: UserProfile = null;
       if (currentRole === "student") {
-        const profile = await getStudentProfile();
-        setUser(profile);
+        profile = await getStudentProfile();
       } else if (currentRole === "school") {
-        const profile = await getSchoolProfile();
-        setUser(profile);
+        profile = await getSchoolProfile();
       } else if (currentRole === "parent") {
-        const profile = await getParentProfile();
-        setUser(profile);
+        profile = await getParentProfile();
       } else if (currentRole === "admin") {
-        const profile = await getAdminProfile();
-        setUser(profile);
+        profile = await getAdminProfile();
+      } else if (currentRole === "teacher") {
+        profile = await getTeacherProfile();
       }
+      setUser(profile);
+      // Kept so an offline-first session can resume without a round trip.
+      if (profile) void writeCache(`profile:${currentRole}`, profile);
     } catch (err: any) {
+      // Only an actual rejection by the server means the session is invalid.
+      // A request that never got there (offline, server down) must not sign
+      // the learner out — offline learning depends on the session surviving
+      // a dead network.
+      const rejectedByServer = err?.status === 401 || err?.status === 403;
+      if (!rejectedByServer) {
+        const cached = await readCache<UserProfile>(`profile:${currentRole}`);
+        if (cached) {
+          setUser(cached);
+          return;
+        }
+      }
       console.error("Failed to fetch user profile:", err);
       // Clear invalid session
       clearStoredAuth();
@@ -84,15 +105,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const initAuth = async () => {
       setLoading(true);
-      const storedToken = getStoredToken();
-      const storedRole = getStoredRole();
+      try {
+        const storedToken = getStoredToken();
+        const storedRole = getStoredRole();
 
-      if (storedToken && storedRole) {
-        setToken(storedToken);
-        setRole(storedRole);
-        await fetchProfileForRole(storedRole);
+        if (storedToken && storedRole) {
+          setToken(storedToken);
+          setRole(storedRole);
+          await fetchProfileForRole(storedRole);
+        }
+      } catch (e) {
+        console.error("Auth initialization error:", e);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     };
 
     initAuth();
@@ -111,6 +137,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         res = await loginParent(data);
       } else if (loginRole === "admin") {
         res = await loginAdmin(data);
+      } else if (loginRole === "teacher") {
+        res = await loginTeacher(data);
       }
       if (res) {
         setToken(res.access_token);
@@ -119,6 +147,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (err: any) {
       setError(err.message || "Failed to log in.");
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loginOTP = async (
+    loginRole: Role,
+    phone_number: string,
+    otp_code: string,
+    branch_name?: string
+  ) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await loginWithOTP({
+        phone_number,
+        otp_code,
+        role: loginRole,
+        branch_name,
+      });
+      if (res) {
+        setToken(res.access_token);
+        setRole(loginRole);
+        await fetchProfileForRole(loginRole);
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to log in with OTP.");
       throw err;
     } finally {
       setLoading(false);
@@ -136,6 +192,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         res = await registerSchool(data);
       } else if (regRole === "parent") {
         res = await registerParent(data);
+      } else if (regRole === "teacher") {
+        res = await registerTeacher(data);
       }
       if (res) {
         setToken(res.access_token);
@@ -183,6 +241,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         loading,
         error,
         login,
+        loginOTP,
         register,
         logout,
         refreshProfile,

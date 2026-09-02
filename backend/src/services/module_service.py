@@ -1,7 +1,7 @@
 import asyncio
 import uuid
 from datetime import datetime, timezone
-from typing import Sequence
+from typing import Optional, Sequence
 
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +11,7 @@ from src.ai.ocr_service import run_ocr_background
 from src.models.module import Module, OcrStatus, SourceType
 from src.models.ncert import NCERTBook
 from src.schemas.module import NCERTModuleAddRequest
+from src.services.quiz_service import ALL_SUBJECTS
 from src.utils.file_utils import (
     delete_cloudinary_asset,
     upload_images_as_pdf,
@@ -18,16 +19,75 @@ from src.utils.file_utils import (
 )
 
 
+def _normalize_subject(subject: Optional[str]) -> Optional[str]:
+    """Validate against the diagnostic quiz's known subject set. Returns None
+    (rather than raising) for blank input, since subject is optional at
+    upload time — a module without a recognized subject just isn't picked
+    up as a source for quiz question generation."""
+    if not subject or not subject.strip():
+        return None
+    normalized = subject.strip()
+    matches = [s for s in ALL_SUBJECTS if s.lower() == normalized.lower()]
+    if not matches:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown subject '{subject}'. Must be one of: {', '.join(ALL_SUBJECTS)}.",
+        )
+    return matches[0]
+
+
 async def get_class_modules(
-    branch_name: str, class_number: int, session: AsyncSession
+    branch_name: str,
+    class_number: int,
+    session: AsyncSession,
+    subject: Optional[str] = None,
 ) -> list[Module]:
-    result = await session.execute(
-        select(Module).where(
-            Module.branch_name == branch_name,
-            Module.class_number == class_number,
-        ).order_by(Module.created_at)
-    )
-    return list(result.scalars().all())
+    stmt = select(Module).where(
+        Module.branch_name == branch_name,
+        Module.class_number == class_number,
+    ).order_by(Module.created_at)
+    result = await session.execute(stmt)
+    modules = list(result.scalars().all())
+
+    # If no branch-specific module exists yet for this class, auto-link NCERT books as school modules!
+    if not modules:
+        ncert_res = await session.execute(
+            select(NCERTBook).where(NCERTBook.class_number == class_number)
+        )
+        ncert_books = list(ncert_res.scalars().all())
+
+        new_modules = []
+        for book in ncert_books:
+            sub_slug = (book.subject or "general").lower().replace(" ", "-")
+            mod = Module(
+                branch_name=branch_name,
+                class_number=book.class_number,
+                subject=book.subject,
+                title=book.title,
+                description=book.description or f"NCERT {book.subject} Textbook for Class {book.class_number}",
+                source_type=SourceType.NCERT,
+                file_url=book.file_url or f"/ncert/class-{book.class_number}-{sub_slug}.pdf",
+                ncert_book_id=book.id,
+                ocr_status=OcrStatus.DONE,
+            )
+            session.add(mod)
+            new_modules.append(mod)
+
+        if new_modules:
+            await session.commit()
+            for m in new_modules:
+                await session.refresh(m)
+            modules = new_modules
+
+    # Filter by subject if specified and not 'General'
+    if subject and subject.strip().lower() not in ("general", "all", "none", ""):
+        clean_sub = subject.strip().lower()
+        modules = [
+            m for m in modules
+            if not m.subject or clean_sub in m.subject.strip().lower() or m.subject.strip().lower() in clean_sub or m.subject.strip().lower() == "general"
+        ]
+
+    return modules
 
 
 async def add_pdf_module(
@@ -36,7 +96,10 @@ async def add_pdf_module(
     title: str,
     file: UploadFile,
     session: AsyncSession,
+    subject: Optional[str] = None,
 ) -> Module:
+    file_bytes = await file.read()
+    await file.seek(0)
     upload = await upload_pdf(file, folder=f"decode-sih/{branch_name}/class-{class_number}")
     module = Module(
         branch_name=branch_name,
@@ -45,10 +108,39 @@ async def add_pdf_module(
         source_type=SourceType.PDF_UPLOAD,
         file_url=upload["url"],
         cloudinary_public_id=upload["public_id"],
+        subject=_normalize_subject(subject),
         # PDF uploads have no raw images — OCR is not applicable
         ocr_status=OcrStatus.NA,
     )
     session.add(module)
+    await session.flush()
+
+    # Extract text from uploaded PDF for chapter segregation & RAG
+    extracted_text = ""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages_text = [p.extract_text().strip() for p in reader.pages if p.extract_text()]
+        if pages_text:
+            extracted_text = "\n\n".join(pages_text)
+    except Exception as e:
+        logger.warning(f"[PDF Ingest] Could not extract text from PDF for module {title}: {e}")
+
+    initial_text = extracted_text if extracted_text.strip() else f"Chapter 1: {title}\n\nThis module contains curriculum materials for Class {class_number} {subject or 'General'}: {title}."
+
+    # Ingest document chunks & segregated chapters for RAG & test creation
+    from src.services.chunk_service import ingest_module_text
+    await ingest_module_text(
+        session=session,
+        branch_name=branch_name,
+        class_number=class_number,
+        subject=subject or "General",
+        text=initial_text,
+        module_id=module.id,
+        module_title=title,
+    )
+
     return module
 
 
@@ -58,6 +150,7 @@ async def add_images_module(
     title: str,
     files: Sequence[UploadFile],
     session: AsyncSession,
+    subject: Optional[str] = None,
 ) -> Module:
     upload = await upload_images_as_pdf(
         files, folder=f"decode-sih/{branch_name}/class-{class_number}"
@@ -69,6 +162,7 @@ async def add_images_module(
         source_type=SourceType.IMAGE_UPLOAD,
         file_url=upload["url"],
         cloudinary_public_id=upload["public_id"],
+        subject=_normalize_subject(subject),
         # OCR starts immediately in background; status begins as "pending"
         ocr_status=OcrStatus.PENDING,
     )
@@ -83,6 +177,7 @@ async def add_images_module(
             class_number=class_number,
             branch_name=branch_name,
             image_bytes_list=upload["image_bytes_list"],
+            subject=subject,
         )
     )
     return module
@@ -115,10 +210,66 @@ async def add_ncert_module(
         source_type=SourceType.NCERT,
         file_url=ncert_book.file_url or "",
         ncert_book_id=ncert_book.id,
+        # Auto-filled from the book — an NCERT-sourced module's content is
+        # already fully covered by the generic curriculum question bank, so
+        # it never needs its own module-grounded generation, but subject is
+        # still recorded for consistency/display.
+        subject=ncert_book.subject,
         # NCERT books already have structured text — OCR not applicable
         ocr_status=OcrStatus.NA,
     )
     session.add(module)
+    await session.flush()
+
+    # Link/copy NCERT template chunks to this branch's module chunks
+    from src.models.chunk import DocumentChunk
+    from src.services.chunk_service import ingest_module_text
+
+    # Copy any existing global template chunks for this NCERT book into branch chunks
+    ncert_chunks_res = await session.execute(
+        select(DocumentChunk).where(DocumentChunk.ncert_book_id == ncert_book.id)
+    )
+    ncert_chunks = list(ncert_chunks_res.scalars().all())
+
+    if ncert_chunks:
+        for template_chunk in ncert_chunks:
+            # Create a branch-specific chunk copy linked to module
+            branch_chunk = DocumentChunk(
+                module_id=module.id,
+                ncert_book_id=ncert_book.id,
+                branch_name=branch_name,
+                class_number=class_number,
+                subject=ncert_book.subject,
+                chapter_number=template_chunk.chapter_number,
+                chapter_title=template_chunk.chapter_title,
+                chunk_index=template_chunk.chunk_index,
+                content=template_chunk.content,
+                token_count=template_chunk.token_count,
+                char_count=template_chunk.char_count,
+                start_char=template_chunk.start_char,
+                end_char=template_chunk.end_char,
+                embedding=template_chunk.embedding,
+            )
+            session.add(branch_chunk)
+    else:
+        # Fallback: check if hand-authored chapter text exists in NCERT_CHAPTER_TEXT
+        from src.db.ncert_content import NCERT_CHAPTER_TEXT
+        full_text = NCERT_CHAPTER_TEXT.get((ncert_book.subject, ncert_book.class_number))
+        if not full_text:
+            book_desc = ncert_book.description or ncert_book.title
+            full_text = f"Chapter 1: Overview\n\n{book_desc}"
+
+        await ingest_module_text(
+            session=session,
+            branch_name=branch_name,
+            class_number=class_number,
+            subject=ncert_book.subject,
+            text=full_text,
+            module_id=module.id,
+            ncert_book_id=ncert_book.id,
+            module_title=module.title,
+        )
+
     return module
 
 
