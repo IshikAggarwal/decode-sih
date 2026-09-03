@@ -77,11 +77,9 @@ function newEventId(): string {
 }
 
 /** Device-local Y-M-D, used only to scope the LESSON_COMPLETED dedupe key
- * below to "this lesson, today" — not the streak's own day boundary (that
- * stays server-side, in the student's stored timezone; see
- * gamification_service.local_date_for). Coarse alignment here is fine: this
- * key only decides whether two writes are "the same completion" or two
- * separate ones, never whether a streak day counts. */
+ * below to "this lesson, today". Coarse alignment here is fine: this key
+ * only decides whether two writes are "the same completion" or two separate
+ * ones. */
 function localDateKey(): string {
   const d = new Date();
   const y = d.getFullYear();
@@ -129,9 +127,11 @@ export async function recordLearningEvent(input: {
   // `lesson:{lesson_id}` — this closes the same gap one layer earlier).
   // Scoped to the day, not just the lesson: a lesson genuinely re-finished
   // on a *later* day (e.g. revisited for review) must still get its own
-  // row, because that is what makes register_active_day count that day
-  // toward the streak — collapsing it into the very first completion ever
-  // would silently stop later replays from ever registering a streak day.
+  // row, so that revisit shows up in recent activity / last_activity_at —
+  // collapsing it into the very first completion ever would silently hide
+  // later replays from those views (XP is unaffected either way: it is
+  // paid at most once per lesson via idempotency_key `lesson:{lesson_id}`,
+  // not per day).
   // Every other event type keeps a random id: re-attempting a check slide
   // or restarting a lesson within one sitting is real, separate activity
   // worth its own row.
@@ -336,6 +336,19 @@ export function applyPendingEvents(
   const totalLessons = modules.reduce((sum, m) => sum + m.total_lessons, 0);
   const completedLessons = modules.reduce((sum, m) => sum + m.completed_lessons, 0);
 
+  // Approximate pending points bonus for un-synced events
+  let bonusPoints = 0;
+  const serverKnownLessonIds = new Set(
+    progress.modules.flatMap((m) => m.completed_lesson_ids)
+  );
+  const newlyCompleted = new Set<string>();
+  for (const c of completions) {
+    if (c.lesson_id && !serverKnownLessonIds.has(c.lesson_id)) {
+      newlyCompleted.add(c.lesson_id);
+    }
+  }
+  bonusPoints += newlyCompleted.size * 50;
+
   return {
     ...progress,
     modules,
@@ -345,5 +358,7 @@ export function applyPendingEvents(
     modules_completed: modules.filter((m) => m.status === "completed").length,
     modules_in_progress: modules.filter((m) => m.status === "in_progress").length,
     modules_not_started: modules.filter((m) => m.status === "not_started").length,
+    points: (progress.points ?? 0) + bonusPoints,
+    current_streak: Math.max(progress.current_streak ?? 0, completions.length > 0 ? 1 : 0),
   };
 }
